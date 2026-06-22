@@ -1,14 +1,18 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter/services.dart';
+import 'package:personal/providers/app_session.dart';
 
+import 'models/connected_device_view_data.dart';
+import 'models/decoder_settings.dart';
+import 'models/pull_test_record.dart';
+import 'models/scale_reading.dart';
+import 'services/scale_payload_service.dart';
+
+const int att = 100;
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const BleScaleApp());
@@ -345,7 +349,7 @@ class ConnectionSetupPage extends StatefulWidget {
 }
 
 class _ConnectionSetupPageState extends State<ConnectionSetupPage> {
-  static const int _maxChartPoints = 10;
+  static const int _maxChartPoints = 50;
 
   final Map<DeviceIdentifier, ScanResult> _scanResults =
       <DeviceIdentifier, ScanResult>{};
@@ -553,7 +557,7 @@ class _ConnectionSetupPageState extends State<ConnectionSetupPage> {
 
     _chartAggregationTimer?.cancel();
     _chartAggregationTimer = Timer.periodic(
-      const Duration(seconds: 1),
+      const Duration(milliseconds: att),
       (_) => _flushCompletedBucket(),
     );
 
@@ -583,7 +587,8 @@ class _ConnectionSetupPageState extends State<ConnectionSetupPage> {
   void _recordReading(ScaleReading reading) {
     final DateTime startTime = _streamStartedAt ?? reading.timestamp;
     _streamStartedAt ??= startTime;
-    final int secondBucket = reading.timestamp.difference(startTime).inSeconds;
+    final int secondBucket =
+        reading.timestamp.difference(startTime).inMilliseconds ~/ att;
 
     if (_activeSecondBucket == null) {
       _activeSecondBucket = secondBucket;
@@ -615,7 +620,8 @@ class _ConnectionSetupPageState extends State<ConnectionSetupPage> {
       return;
     }
 
-    final int currentSecond = DateTime.now().difference(startTime).inSeconds;
+    final int currentSecond =
+        DateTime.now().difference(startTime).inMilliseconds ~/ att;
     if (currentSecond > _activeSecondBucket!) {
       _flushActiveBucket();
       _publishConnectedViewData();
@@ -1101,7 +1107,7 @@ class _WeightChart extends StatelessWidget {
     for (final ScaleReading reading in readings) {
       final double seconds = startTime == null
           ? 0
-          : reading.timestamp.difference(startTime).inMilliseconds / 1000.0;
+          : reading.timestamp.difference(startTime).inMilliseconds / att;
       xValues.add(seconds);
       yValues.add(reading.weightKg);
     }
@@ -1187,144 +1193,6 @@ class _WeightChart extends StatelessWidget {
   }
 }
 
-enum PullSide { left, right }
-
-extension PullSideLabel on PullSide {
-  String get label => this == PullSide.left ? 'Left' : 'Right';
-}
-
-class PullTestRecord {
-  const PullTestRecord({
-    required this.side,
-    required this.maxKg,
-    required this.timestamp,
-  });
-
-  final PullSide side;
-  final double maxKg;
-  final DateTime timestamp;
-
-  Map<String, Object> toJson() {
-    return <String, Object>{
-      'side': side.name,
-      'maxKg': maxKg,
-      'timestamp': timestamp.toIso8601String(),
-    };
-  }
-
-  factory PullTestRecord.fromJson(Map<String, dynamic> json) {
-    final String sideRaw = (json['side'] ?? '').toString();
-    final PullSide side = sideRaw == PullSide.right.name
-        ? PullSide.right
-        : PullSide.left;
-    final double maxKg = (json['maxKg'] is num)
-        ? (json['maxKg'] as num).toDouble()
-        : 0;
-    final DateTime timestamp =
-        DateTime.tryParse((json['timestamp'] ?? '').toString()) ??
-        DateTime.fromMillisecondsSinceEpoch(0);
-    return PullTestRecord(side: side, maxKg: maxKg, timestamp: timestamp);
-  }
-}
-
-class AppSession extends ChangeNotifier {
-  static const String _recordsStorageKey = 'pull_test_records_v1';
-
-  BluetoothAdapterState adapterState = BluetoothAdapterState.unknown;
-  String? connectedDeviceName;
-  String? connectedDeviceId;
-  final List<PullTestRecord> _records = <PullTestRecord>[];
-
-  AppSession() {
-    _loadRecords();
-  }
-
-  List<PullTestRecord> get records =>
-      List<PullTestRecord>.unmodifiable(_records);
-
-  void setAdapterState(BluetoothAdapterState value) {
-    if (adapterState == value) {
-      return;
-    }
-    adapterState = value;
-    notifyListeners();
-  }
-
-  void setConnectedDevice({required String name, required String id}) {
-    connectedDeviceName = name;
-    connectedDeviceId = id;
-    notifyListeners();
-  }
-
-  void storeTest({required PullSide side, required double maxKg}) {
-    _records.insert(
-      0,
-      PullTestRecord(side: side, maxKg: maxKg, timestamp: DateTime.now()),
-    );
-    if (_records.length > 20) {
-      _records.removeRange(20, _records.length);
-    }
-    _saveRecords();
-    notifyListeners();
-  }
-
-  PullTestRecord? lastRecordFor(PullSide side) {
-    for (final PullTestRecord record in _records) {
-      if (record.side == side) {
-        return record;
-      }
-    }
-    return null;
-  }
-
-  Future<void> _loadRecords() async {
-    String? payload;
-    try {
-      final SharedPreferences preferences =
-          await SharedPreferences.getInstance();
-      payload = preferences.getString(_recordsStorageKey);
-    } on MissingPluginException {
-      return;
-    } on PlatformException {
-      return;
-    }
-
-    if (payload == null || payload.isEmpty) {
-      return;
-    }
-
-    try {
-      final List<dynamic> decoded = jsonDecode(payload) as List<dynamic>;
-      final List<PullTestRecord> loaded = decoded
-          .whereType<Map<String, dynamic>>()
-          .map(PullTestRecord.fromJson)
-          .toList();
-      loaded.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-      _records
-        ..clear()
-        ..addAll(loaded);
-      notifyListeners();
-    } on FormatException {
-      _records.clear();
-    }
-  }
-
-  Future<void> _saveRecords() async {
-    try {
-      final SharedPreferences preferences =
-          await SharedPreferences.getInstance();
-      final String payload = jsonEncode(
-        _records.map((PullTestRecord record) => record.toJson()).toList(),
-      );
-      await preferences.setString(_recordsStorageKey, payload);
-    } on MissingPluginException {
-      return;
-    } on PlatformException {
-      return;
-    }
-  }
-}
-
 class _LegendDot extends StatelessWidget {
   const _LegendDot({required this.label, required this.color});
 
@@ -1373,7 +1241,7 @@ class _ProgressionChart extends StatelessWidget {
 
     for (final PullTestRecord record in sorted) {
       final double secondsFromStart =
-          (record.timestamp.millisecondsSinceEpoch - minMillis) / 1000.0;
+          (record.timestamp.millisecondsSinceEpoch - minMillis) / att;
       final FlSpot spot = FlSpot(secondsFromStart, record.maxKg);
       if (record.side == PullSide.left) {
         leftSpots.add(spot);
@@ -1396,7 +1264,7 @@ class _ProgressionChart extends StatelessWidget {
     return LineChart(
       LineChartData(
         minX: 0,
-        maxX: maxMillis == minMillis ? 1 : (maxMillis - minMillis) / 1000.0,
+        maxX: maxMillis == minMillis ? 1 : (maxMillis - minMillis) / att,
         minY: 0,
         maxY: maxKg * 1.1,
         gridData: const FlGridData(show: true),
@@ -1416,13 +1284,13 @@ class _ProgressionChart extends StatelessWidget {
             sideTitles: SideTitles(
               showTitles: true,
               reservedSize: 28,
-              interval: ((maxMillis - minMillis) / 1000.0 / 2).clamp(
+              interval: ((maxMillis - minMillis) / att / 2).clamp(
                 1,
                 double.infinity,
               ),
               getTitlesWidget: (double value, TitleMeta meta) {
                 final DateTime time = DateTime.fromMillisecondsSinceEpoch(
-                  minMillis + (value * 1000).round(),
+                  minMillis + (value * att).round(),
                 );
                 return Padding(
                   padding: const EdgeInsets.only(top: 4),
@@ -1464,299 +1332,6 @@ class _ProgressionChart extends StatelessWidget {
         ],
       ),
       duration: Duration.zero,
-    );
-  }
-}
-
-class ConnectedDeviceViewData {
-  const ConnectedDeviceViewData({
-    required this.deviceName,
-    required this.deviceId,
-    required this.reading,
-    required this.history,
-    required this.statusMessage,
-    required this.packetsSeen,
-    required this.lastSeenAt,
-    required this.payloadSummaries,
-    required this.streamStartedAt,
-    required this.overallMaxWeightKg,
-  });
-
-  final String deviceName;
-  final String? deviceId;
-  final ScaleReading? reading;
-  final List<ScaleReading> history;
-  final String? statusMessage;
-  final int packetsSeen;
-  final DateTime? lastSeenAt;
-  final List<String> payloadSummaries;
-  final DateTime? streamStartedAt;
-  final double overallMaxWeightKg;
-
-  factory ConnectedDeviceViewData.empty() {
-    return const ConnectedDeviceViewData(
-      deviceName: 'No connected device',
-      deviceId: null,
-      reading: null,
-      history: <ScaleReading>[],
-      statusMessage: null,
-      packetsSeen: 0,
-      lastSeenAt: null,
-      payloadSummaries: <String>[],
-      streamStartedAt: null,
-      overallMaxWeightKg: 1,
-    );
-  }
-}
-
-class ScaleReading {
-  const ScaleReading({
-    required this.weightKg,
-    required this.forceNewton,
-    required this.source,
-    required this.rawPayloadHex,
-    required this.timestamp,
-  });
-
-  final double weightKg;
-  final double forceNewton;
-  final String source;
-  final String rawPayloadHex;
-  final DateTime timestamp;
-}
-
-class ScalePayloadDecoder {
-  static const int _whc06ManufacturerId = 0x0100;
-  static const int _whc06WeightOffset = 10;
-
-  static ScaleReading? tryDecode(ScanResult result, DecoderSettings settings) {
-    final List<int>? whc06Payload =
-        result.advertisementData.manufacturerData[_whc06ManufacturerId];
-    final double? whc06Kg = _decodeWhc06WeightKg(whc06Payload);
-    if (whc06Kg != null) {
-      return ScaleReading(
-        weightKg: whc06Kg,
-        forceNewton: whc06Kg * 9.80665,
-        source: 'manufacturer 0x0100 (WH-C06)',
-        rawPayloadHex: _toHex(whc06Payload!),
-        timestamp: DateTime.now(),
-      );
-    }
-
-    final List<_PayloadSource> payloads = _collectPayloads(result);
-
-    for (final _PayloadSource payload in payloads) {
-      final double? kg = _decodeWeightKg(payload.bytes, settings);
-      if (kg == null) {
-        continue;
-      }
-      return ScaleReading(
-        weightKg: kg,
-        forceNewton: kg * 9.80665,
-        source: payload.source,
-        rawPayloadHex: _toHex(payload.bytes),
-        timestamp: DateTime.now(),
-      );
-    }
-
-    for (final _PayloadSource payload in payloads) {
-      final double? kg = _decodeAsciiWeightKg(payload.bytes);
-      if (kg == null) {
-        continue;
-      }
-      return ScaleReading(
-        weightKg: kg,
-        forceNewton: kg * 9.80665,
-        source: '${payload.source} (ascii)',
-        rawPayloadHex: _toHex(payload.bytes),
-        timestamp: DateTime.now(),
-      );
-    }
-
-    return null;
-  }
-
-  static List<String> describePayloads(ScanResult result) {
-    final List<_PayloadSource> payloads = _collectPayloads(result);
-    final List<int>? whc06Payload =
-        result.advertisementData.manufacturerData[_whc06ManufacturerId];
-
-    final List<String> rows = <String>[];
-    if (whc06Payload != null) {
-      rows.add(
-        'WH-C06 payload (0x0100): ${whc06Payload.length} bytes → ${_toHex(whc06Payload)}',
-      );
-    }
-
-    rows.addAll(
-      payloads.map(
-        (payload) =>
-            '${payload.source}: ${payload.bytes.length} bytes → ${_toHex(payload.bytes)}',
-      ),
-    );
-
-    return rows.toList(growable: false);
-  }
-
-  static List<_PayloadSource> _collectPayloads(ScanResult result) {
-    final List<_PayloadSource> payloads = <_PayloadSource>[];
-
-    result.advertisementData.manufacturerData.forEach((
-      int id,
-      List<int> bytes,
-    ) {
-      if (bytes.isNotEmpty) {
-        payloads.add(
-          _PayloadSource('manufacturer 0x${id.toRadixString(16)}', bytes),
-        );
-      }
-    });
-
-    result.advertisementData.serviceData.forEach((Guid uuid, List<int> bytes) {
-      if (bytes.isNotEmpty) {
-        payloads.add(_PayloadSource('service $uuid', bytes));
-      }
-    });
-
-    return payloads;
-  }
-
-  static double? _decodeWeightKg(List<int> bytes, DecoderSettings settings) {
-    if (bytes.length < (settings.offset + settings.lengthBytes)) {
-      return null;
-    }
-
-    final List<int> rawSlice = bytes.sublist(
-      settings.offset,
-      settings.offset + settings.lengthBytes,
-    );
-
-    int rawValue = 0;
-    if (settings.endian == Endian.little) {
-      for (int index = 0; index < rawSlice.length; index++) {
-        rawValue |= rawSlice[index] << (8 * index);
-      }
-    } else {
-      for (final int byte in rawSlice) {
-        rawValue = (rawValue << 8) | byte;
-      }
-    }
-
-    if (settings.signed) {
-      final int bitWidth = settings.lengthBytes * 8;
-      final int signMask = 1 << (bitWidth - 1);
-      if ((rawValue & signMask) != 0) {
-        rawValue -= 1 << bitWidth;
-      }
-    }
-
-    final double kg = rawValue * settings.scale;
-
-    if (kg.abs() > 100000) {
-      return null;
-    }
-
-    return kg;
-  }
-
-  static double? _decodeWhc06WeightKg(List<int>? bytes) {
-    if (bytes == null || bytes.length <= (_whc06WeightOffset + 1)) {
-      return null;
-    }
-
-    final int rawWeight =
-        (bytes[_whc06WeightOffset] << 8) | bytes[_whc06WeightOffset + 1];
-    final double kg = rawWeight / 100.0;
-
-    if (kg.abs() > 100000) {
-      return null;
-    }
-
-    return kg;
-  }
-
-  static double? _decodeAsciiWeightKg(List<int> bytes) {
-    final String ascii = String.fromCharCodes(
-      bytes.where((int byte) => byte >= 32 && byte <= 126),
-    );
-    if (ascii.isEmpty) {
-      return null;
-    }
-
-    final RegExpMatch? match = RegExp(r'[-+]?\d+(?:\.\d+)?').firstMatch(ascii);
-    if (match == null) {
-      return null;
-    }
-
-    final double? parsed = double.tryParse(match.group(0)!);
-    if (parsed == null) {
-      return null;
-    }
-
-    final String normalized = ascii.toLowerCase();
-    if (normalized.contains('lb')) {
-      return parsed * 0.45359237;
-    }
-    if (normalized.contains('kg')) {
-      return parsed;
-    }
-
-    return parsed;
-  }
-
-  static String _toHex(List<int> bytes) {
-    return bytes
-        .map((int byte) => byte.toRadixString(16).padLeft(2, '0'))
-        .join(' ')
-        .toUpperCase();
-  }
-}
-
-class _PayloadSource {
-  const _PayloadSource(this.source, this.bytes);
-
-  final String source;
-  final List<int> bytes;
-}
-
-class DecoderSettings {
-  const DecoderSettings({
-    required this.offset,
-    required this.lengthBytes,
-    required this.scale,
-    required this.endian,
-    required this.signed,
-  });
-
-  final int offset;
-  final int lengthBytes;
-  final double scale;
-  final Endian endian;
-  final bool signed;
-
-  factory DecoderSettings.defaults() {
-    return const DecoderSettings(
-      offset: 10,
-      lengthBytes: 2,
-      scale: 0.01,
-      endian: Endian.big,
-      signed: false,
-    );
-  }
-
-  DecoderSettings copyWith({
-    int? offset,
-    int? lengthBytes,
-    double? scale,
-    Endian? endian,
-    bool? signed,
-  }) {
-    return DecoderSettings(
-      offset: offset ?? this.offset,
-      lengthBytes: lengthBytes ?? this.lengthBytes,
-      scale: scale ?? this.scale,
-      endian: endian ?? this.endian,
-      signed: signed ?? this.signed,
     );
   }
 }
