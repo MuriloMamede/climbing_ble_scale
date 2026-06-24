@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../models/scale_reading.dart';
-import '../services/scale_payload_service.dart';
+import 'scale_payload_service.dart';
 import '../models/decoder_settings.dart';
 
 class BleService {
